@@ -1,0 +1,866 @@
+#!/usr/bin/env bash
+# Updates: one place for Omarchy, system packages (pacman), AUR apps, mise dev
+# tools, git-managed shell plugins and git themes. Checking never changes
+# anything. Updating happens only in a terminal, after you said yes in the panel.
+#
+#   updates check                      check everything, write the cache, print it
+#   updates auto                       check when the cache is stale or older than
+#                                      checkHours; notify about updates that are new
+#   updates run [--dry-run] <what...>  for a terminal: all | system | aur | mise |
+#                                      plugins | themes | plugin:<id>
+#
+# Config (optional): ~/.config/omarchy/updates.json  {"checkHours": 6, "notify": true}
+# Cache:             ~/.cache/omarchy/updates.json
+# State:             ~/.local/state/omarchy/updates-notified.json
+#
+# Environment:
+#   OMARCHY_NO_NOTIFY=1  print the notification instead of sending it
+#   UPDATES_DRY_RUN=1    same as `run --dry-run`: print what would run, change nothing
+set -uo pipefail
+
+export GIT_TERMINAL_PROMPT=0
+export GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -oBatchMode=yes}"
+
+SELF=$(readlink -f "${BASH_SOURCE[0]}")
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/omarchy"
+CACHE="$CACHE_DIR/updates.json"
+LOCK="$CACHE_DIR/updates.lock"
+AUTO_LOCK="$CACHE_DIR/updates-auto.lock"
+RUN_LOCK="$CACHE_DIR/updates-run.lock"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy"
+STATE="$STATE_DIR/updates-notified.json"
+PATCH_DIR="$STATE_DIR/updates-patches"
+CONFIG="$HOME/.config/omarchy/updates.json"
+PLUGINS_DIR="$HOME/.config/omarchy/plugins"
+PLUGIN_MANAGER_ID="io.github.bonesgit.omarchy-ultimate-plugin-mgr"
+
+DRY_RUN=0
+[[ ${UPDATES_DRY_RUN:-} == 1 ]] && DRY_RUN=1
+
+mkdir -p "$CACHE_DIR" "$STATE_DIR"
+
+# A config value, or the fallback when the key is missing or null. (jq's `//`
+# would also replace an explicit false, so "notify": false never worked.)
+config() {
+  local value
+  value=$(jq -r --arg k "$1" 'if type == "object" and .[$k] != null then .[$k] else empty end' "$CONFIG" 2>/dev/null)
+  echo "${value:-$2}"
+}
+
+valid_id() {
+  [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ && $1 != *..* ]]
+}
+
+# "name old -> new [age]" lines (checkupdates, yay -Qua) as [{name, from, to}].
+arrow_lines_json() {
+  jq -Rn '[inputs | select(test(" -> ")) | capture("^(?<name>\\S+)\\s+(?<from>\\S+)\\s+->\\s+(?<to>\\S+)")]'
+}
+
+first_error_line() {
+  grep -v '^\s*$' "$1" 2>/dev/null | grep -viE '^(warning|::)' | head -1 | sed 's/^[[:space:]>-]*//' | cut -c1-160
+}
+
+# Apply a jq filter to the cache in place. Best effort: the cache is only a
+# display aid, so a failure here must never stop an update.
+cache_update() {
+  [[ -s $CACHE ]] || return 0
+  local tmp="$CACHE.$$.tmp"
+  if jq -c "$@" "$CACHE" >"$tmp" 2>/dev/null; then
+    mv -f "$tmp" "$CACHE"
+  else
+    rm -f "$tmp"
+  fi
+}
+
+# True when no `updates run` holds the run lock.
+run_lock_free() {
+  (flock -n 8) 8>>"$RUN_LOCK" 2>/dev/null
+}
+
+# ---------- Plugins ----------
+
+# "<remote> <ref>" a plugin updates from: its branch's upstream when it has
+# one, else origin's default branch (what `omarchy plugin update` uses).
+# Prints nothing for a checkout without a remote.
+plugin_source() {
+  local dir=$1 branch remote merge
+  branch=$(git -C "$dir" symbolic-ref -q --short HEAD 2>/dev/null)
+  if [[ -n $branch ]]; then
+    remote=$(git -C "$dir" config --get "branch.$branch.remote" 2>/dev/null)
+    merge=$(git -C "$dir" config --get "branch.$branch.merge" 2>/dev/null)
+    if [[ -n $remote && $remote != . && -n $merge ]]; then
+      echo "$remote $merge"
+      return
+    fi
+  fi
+  if git -C "$dir" remote get-url origin >/dev/null 2>&1; then
+    echo "origin HEAD"
+  fi
+}
+
+# What happens to the uncommitted changes in a plugin if it moves from $2 to
+# $3. First line: kept (they re-apply cleanly), upstream (the new version
+# already contains them), clash (they touch the same lines) or unknown. For
+# clash, the files follow, one per line. Changes nothing in the checkout: the
+# snapshot commit from `git stash create` is not stored in any ref.
+local_changes_fate() {
+  local dir=$1 base=$2 target=$3 snap out rc tree
+  snap=$(git -C "$dir" stash create 2>/dev/null)
+  if [[ -z $snap ]]; then
+    echo kept
+    return
+  fi
+  out=$(git -C "$dir" merge-tree --write-tree --name-only --no-messages --merge-base="$base" "$snap" "$target" 2>/dev/null)
+  rc=$?
+  case $rc in
+  0)
+    tree=$(git -C "$dir" rev-parse "$target^{tree}" 2>/dev/null)
+    if [[ ${out%%$'\n'*} == "$tree" ]]; then echo upstream; else echo kept; fi
+    ;;
+  1)
+    echo clash
+    tail -n +2 <<<"$out" | grep -v '^$' | sort -u
+    ;;
+  *) echo unknown ;;
+  esac
+}
+
+# Files with uncommitted changes, one per line.
+dirty_files() {
+  git -C "$1" diff --name-only HEAD 2>/dev/null
+}
+
+plugin_one() {
+  local dir=$1 id name head src remote ref out rc target="" behind=0 ahead=0
+  local status=ok error="" dirty=false fate="" files="[]" subjects="[]"
+  local -a info=()
+  id=${dir##*/}
+  name=$(jq -r '.name // empty' "$dir/manifest.json" 2>/dev/null)
+  head=$(git -C "$dir" rev-parse -q --verify 'HEAD^{commit}' 2>/dev/null)
+  [[ -n $(git -C "$dir" status --porcelain --untracked-files=no 2>/dev/null) ]] && dirty=true
+  src=$(plugin_source "$dir")
+
+  if [[ -z $head ]]; then
+    status=error
+    error="Not a usable git checkout"
+  elif [[ -z $src ]]; then
+    status=local
+  else
+    read -r remote ref <<<"$src"
+    out=$(timeout 30 git -C "$dir" fetch --quiet --no-tags "$remote" "$ref" 2>&1)
+    rc=$?
+    if ((rc == 0)); then
+      target=$(git -C "$dir" rev-parse -q --verify 'FETCH_HEAD^{commit}' 2>/dev/null)
+      behind=$(git -C "$dir" rev-list --count "HEAD..$target" 2>/dev/null) || behind=0
+      ahead=$(git -C "$dir" rev-list --count "$target..HEAD" 2>/dev/null) || ahead=0
+      if ((behind > 0)); then
+        subjects=$(git -C "$dir" log --format=%s -n 3 "HEAD..$target" 2>/dev/null | jq -Rn '[inputs]')
+        if ((ahead > 0)); then
+          # Local commits, or upstream rewrote its history: a fast-forward
+          # is impossible, so this is for the user to sort out by hand.
+          status=diverged
+        elif [[ $dirty == true ]]; then
+          mapfile -t info < <(local_changes_fate "$dir" "$head" "$target")
+          fate=${info[0]:-unknown}
+          if [[ $fate == clash ]]; then
+            files=$(printf '%s\n' "${info[@]:1}" | jq -Rn '[inputs | select(length > 0)]')
+          else
+            files=$(dirty_files "$dir" | jq -Rn '[inputs | select(length > 0)]')
+          fi
+        fi
+      fi
+    else
+      status=error
+      if ((rc == 124)); then
+        error="Timed out"
+      else
+        error=$(grep -v '^\s*$' <<<"$out" | head -1 | sed 's/^fatal: //' | cut -c1-160)
+        [[ -n $error ]] || error="Fetch failed"
+      fi
+    fi
+  fi
+
+  jq -nc --arg name "$id" --arg label "${name:-$id}" --arg from "${head:0:7}" --arg to "${target:0:7}" \
+    --argjson behind "${behind:-0}" --argjson ahead "${ahead:-0}" --argjson dirty "$dirty" \
+    --arg status "$status" --arg error "$error" --arg fate "$fate" --argjson files "$files" \
+    --argjson subjects "$subjects" '
+    {name: $name, label: $label, from: $from, to: $to, behind: $behind, ahead: $ahead,
+     status: $status, error: $error, dirty: $dirty, subjects: $subjects}
+    + (if $fate != "" then {localChanges: $fate, localFiles: $files} else {} end)'
+}
+export -f plugin_one plugin_source local_changes_fate dirty_files
+
+# {plugins: [...], plain: <plugin folders that aren't git checkouts>}
+plugins_json() {
+  local d plain=0
+  local -a git_dirs=()
+  if [[ -d $PLUGINS_DIR ]]; then
+    # Hidden folders are backups and staging dirs; a symlinked plugin is
+    # someone's working copy. Neither is ours to update.
+    for d in "$PLUGINS_DIR"/*/; do
+      d=${d%/}
+      [[ -f $d/manifest.json ]] || continue
+      if [[ ! -L $d && -d $d/.git ]]; then
+        git_dirs+=("$d")
+      else
+        ((plain++))
+      fi
+    done
+  fi
+  if ((${#git_dirs[@]})); then
+    printf '%s\0' "${git_dirs[@]}" | xargs -0 -r -P 8 -I{} bash -c 'plugin_one "$1"' _ {}
+  fi | jq -sc --argjson plain "$plain" '{plugins: sort_by(.name), plain: $plain}'
+}
+
+# ---------- Themes ----------
+
+theme_one() {
+  local dir=$1 name=${1##*/} out rc from to="" behind=0 error=""
+  from=$(git -C "$dir" rev-parse --short HEAD 2>/dev/null)
+  out=$(timeout 30 git -C "$dir" fetch --quiet 2>&1)
+  rc=$?
+  if ((rc == 0)); then
+    to=$(git -C "$dir" rev-parse --short '@{upstream}' 2>/dev/null)
+    if [[ -n $to ]]; then
+      behind=$(git -C "$dir" rev-list --count 'HEAD..@{upstream}' 2>/dev/null) || behind=0
+    else
+      error="No upstream branch"
+    fi
+  elif ((rc == 124)); then
+    error="Timed out"
+  else
+    error=$(grep -v '^\s*$' <<<"$out" | head -1 | sed 's/^fatal: //' | cut -c1-160)
+    [[ -n $error ]] || error="Fetch failed"
+  fi
+  jq -nc --arg name "$name" --arg from "$from" --arg to "$to" --argjson behind "${behind:-0}" --arg error "$error" \
+    '{name: $name, label: $name, from: $from, to: $to, behind: $behind, error: $error}'
+}
+
+themes_json() {
+  local theme
+  while IFS= read -r theme; do
+    [[ -n $theme ]] && theme_one "$theme"
+  done < <(omarchy-theme-extras 2>/dev/null) | jq -sc 'sort_by(.name)'
+}
+
+# ---------- Check ----------
+
+mark_checking() {
+  local now tmp="$CACHE.$$.tmp"
+  now=$(date +%s)
+  if [[ -s $CACHE ]] && jq -e . "$CACHE" >/dev/null 2>&1; then
+    jq -c --argjson now "$now" '.checking = true | .checkingSince = $now' "$CACHE" >"$tmp"
+  else
+    jq -nc --argjson now "$now" '{at: 0, checking: true, checkingSince: $now, total: 0, omarchy: {available: false, lines: []}, sections: []}' >"$tmp"
+  fi
+  mv -f "$tmp" "$CACHE"
+}
+
+check() {
+  exec 9>>"$LOCK"
+  if ! flock -n 9; then
+    # Another check is running (the other bar, or the service): use its result.
+    flock -w 300 9 || true
+    [[ -s $CACHE ]] && cat "$CACHE"
+    return 0
+  fi
+  mark_checking
+
+  local tmp
+  tmp=$(mktemp -d)
+  # shellcheck disable=SC2064
+  trap "rm -rf '$tmp'" EXIT
+  cd "$HOME" || true
+
+  # The lock fds are closed for everything started here, so nothing that
+  # outlives the check can keep the next one waiting.
+  #
+  # Omarchy itself is checked after the system packages: both use
+  # checkupdates' shared temporary database, which must not sync twice at once.
+  (
+    timeout 120 checkupdates --nocolor >"$tmp/system" 2>"$tmp/system.err"
+    echo $? >"$tmp/system.rc"
+    timeout 60 omarchy-update-available >"$tmp/omarchy" 2>/dev/null
+    echo $? >"$tmp/omarchy.rc"
+  ) 7>&- 8>&- 9>&- &
+  (
+    if command -v yay >/dev/null && pacman -Qqm >/dev/null 2>&1; then
+      timeout 120 yay -Qua >"$tmp/aur" 2>"$tmp/aur.err"
+      echo $? >"$tmp/aur.rc"
+    else
+      : >"$tmp/aur"
+      echo 0 >"$tmp/aur.rc"
+    fi
+  ) 7>&- 8>&- 9>&- &
+  (
+    if command -v mise >/dev/null; then
+      # Omarchy updates mise tools with the release-age cooldown switched
+      # off, so check the same way, or the panel says "up to date" while an
+      # update would still install newer versions.
+      MISE_MINIMUM_RELEASE_AGE=0 timeout 120 mise outdated --json >"$tmp/mise" 2>"$tmp/mise.err"
+      echo $? >"$tmp/mise.rc"
+    else
+      echo '{}' >"$tmp/mise"
+      echo 0 >"$tmp/mise.rc"
+    fi
+  ) 7>&- 8>&- 9>&- &
+  plugins_json >"$tmp/plugins" 2>/dev/null 7>&- 8>&- 9>&- &
+  themes_json >"$tmp/themes" 2>/dev/null 7>&- 8>&- 9>&- &
+  wait
+
+  local system aur mise plugins themes omarchy_lines omarchy_available=false rc
+  local system_err="" aur_err="" mise_err="" running=false running_since=0
+
+  # checkupdates: 0 = updates, 2 = none, anything else = it could not check.
+  system=$(arrow_lines_json <"$tmp/system")
+  rc=$(cat "$tmp/system.rc" 2>/dev/null)
+  case $rc in
+  0 | 2) ;;
+  124) system_err="Timed out talking to the package mirrors" ;;
+  *)
+    if grep -q "Cannot fetch updates" "$tmp/system.err" 2>/dev/null; then
+      system_err="Could not reach the package mirrors (offline?)"
+    else
+      system_err=$(first_error_line "$tmp/system.err")
+      [[ -n $system_err ]] || system_err="Could not check (offline?)"
+    fi
+    ;;
+  esac
+
+  if [[ $(cat "$tmp/omarchy.rc" 2>/dev/null) == 0 ]]; then
+    omarchy_available=true
+    omarchy_lines=$(jq -Rn '[inputs | select(length > 0)]' <"$tmp/omarchy")
+  else
+    omarchy_lines="[]"
+  fi
+
+  # Packages that moved to a repo still show up as foreign in yay until the
+  # local database syncs: the repo version is the one that installs.
+  aur=$(arrow_lines_json <"$tmp/aur" | jq -c --argjson sys "$system" '[.[] | select(.name as $n | $sys | map(.name) | index($n) | not)]') || aur="[]"
+  rc=$(cat "$tmp/aur.rc" 2>/dev/null)
+  if [[ $rc == 124 ]]; then
+    aur_err="Timed out talking to the AUR"
+  elif [[ $rc != 0 && $(jq length <<<"$aur") == 0 && -s $tmp/aur.err ]]; then
+    if grep -qiE 'request failed|dial tcp|could not resolve|network' "$tmp/aur.err"; then
+      aur_err="Could not reach the AUR (offline?)"
+    else
+      aur_err=$(first_error_line "$tmp/aur.err")
+    fi
+  fi
+
+  mise=$(jq -c '[to_entries[] | {name: .key, from: (.value.current // ""), to: (.value.latest // "")} | select(.from != .to and .to != "")]' "$tmp/mise" 2>/dev/null) || mise="[]"
+  [[ -n $mise ]] || mise="[]"
+  rc=$(cat "$tmp/mise.rc" 2>/dev/null)
+  if [[ $rc == 124 ]]; then
+    mise_err="Timed out"
+  elif [[ $rc != 0 ]]; then
+    mise_err=$(first_error_line "$tmp/mise.err")
+    [[ -n $mise_err ]] || mise_err="Could not check"
+  fi
+
+  plugins=$(jq -c 'if type == "object" then . else empty end' "$tmp/plugins" 2>/dev/null)
+  [[ -n $plugins ]] || plugins='{"plugins": [], "plain": 0}'
+  themes=$(jq -c 'if type == "array" then . else empty end' "$tmp/themes" 2>/dev/null)
+  [[ -n $themes ]] || themes="[]"
+
+  # An update running in a terminal right now stays visible in the panel.
+  if ! run_lock_free; then
+    running=true
+    running_since=$(jq -r '.runningSince // empty' "$CACHE" 2>/dev/null)
+    [[ $running_since =~ ^[0-9]+$ ]] || running_since=$(date +%s)
+  fi
+
+  if ! jq -n \
+    --argjson at "$(date +%s)" \
+    --argjson omarchyAvailable "$omarchy_available" --argjson omarchyLines "$omarchy_lines" \
+    --argjson system "$system" --arg systemErr "$system_err" \
+    --argjson aur "$aur" --arg aurErr "$aur_err" \
+    --argjson mise "$mise" --arg miseErr "$mise_err" \
+    --argjson plugins "$plugins" --argjson themes "$themes" \
+    --argjson running "$running" --argjson runningSince "$running_since" \
+    --argjson pluginManager "$([[ -d $PLUGINS_DIR/$PLUGIN_MANAGER_ID ]] && echo true || echo false)" '
+    def pending: [.[] | select((.behind // 0) > 0 and (.error // "") == "" and (.status // "ok") == "ok")];
+    ($plugins.plugins) as $p
+    | ([$p[] | select(.status != "local")]) as $remote
+    | ([$p[] | select(.status == "error")]) as $failed
+    | {
+      at: $at,
+      checking: false,
+      stale: false,
+      running: $running,
+      runningSince: $runningSince,
+      pluginManager: $pluginManager,
+      omarchy: {available: $omarchyAvailable, lines: $omarchyLines},
+      sections: [
+        {id: "system",  title: "System & apps (pacman)", items: $system, error: $systemErr},
+        {id: "aur",     title: "AUR apps",         items: $aur,  error: $aurErr},
+        {id: "mise",    title: "Dev tools (mise)", items: $mise, error: $miseErr},
+        {id: "plugins", title: "Shell plugins",
+         items: ($p | pending),
+         errors: [$failed[] | .name],
+         attention: [$p[] | select(.status == "diverged") | {name, label, behind, ahead}],
+         checked: ($remote | length),
+         local: ($plugins.plain + ([$p[] | select(.status == "local")] | length)),
+         error: (if ($remote | length) > 1 and ($failed | length) == ($remote | length)
+                 then "Could not reach any plugin remote (offline?)" else "" end)},
+        {id: "themes",  title: "Themes",
+         items: ($themes | pending),
+         errors: [$themes[] | select(.error != "") | .name],
+         checked: ($themes | length),
+         error: (if ($themes | length) > 1 and ([$themes[] | select(.error != "")] | length) == ($themes | length)
+                 then "Could not reach any theme remote (offline?)" else "" end)}
+      ]
+    }
+    | .total = ([.sections[].items | length] | add)
+  ' >"$CACHE.tmp"; then
+    rm -f "$CACHE.tmp"
+    cache_update '.checking = false'
+    echo "updates: could not build the report" >&2
+    return 1
+  fi
+  mv -f "$CACHE.tmp" "$CACHE"
+  cat "$CACHE"
+}
+
+# ---------- Notifications (the service only, so two bars never notify twice) ----------
+
+summary_line() {
+  jq -r '
+    [.sections[] | select((.items | length) > 0)
+      | "\(.items | length) \({system: "package", aur: "app", mise: "dev tool", plugins: "plugin", themes: "theme"}[.id])\(if (.items | length) > 1 then "s" else "" end)"]
+    | join(" · ")' "$CACHE"
+}
+
+notified_keys() {
+  local old
+  old=$(jq -c 'if type == "array" then . else empty end' "$STATE" 2>/dev/null)
+  echo "${old:-[]}"
+}
+
+# Keys ("section:name:version") of everything pending. A section or plugin
+# that could not be checked this time keeps the keys it had, so a network
+# blip doesn't make old updates look new afterwards.
+update_keys() {
+  jq -c --argjson old "$(notified_keys)" '
+    [.sections[] | .id as $s | .items[] | "\($s):\(.name):\(.to // "")"] as $now
+    | ([.sections[] | select((.error // "") != "") | .id + ":"]
+       + [.sections[] | .id as $s | (.errors // [])[] | "\($s):\(.):"]) as $unknown
+    | $now + [$old[] | select(. as $k | any($unknown[]; . as $p | $k | startswith($p)))]
+    | unique
+  ' "$CACHE"
+}
+
+remember_seen() {
+  local keys
+  keys=$(update_keys 2>/dev/null) && [[ -n $keys ]] && echo "$keys" >"$STATE"
+}
+
+notify_new() {
+  local keys old fresh total head body
+  keys=$(update_keys 2>/dev/null) || return 0
+  [[ -n $keys ]] || return 0
+  old=$(notified_keys)
+  fresh=$(jq -n --argjson now "$keys" --argjson old "$old" '$now - $old | length' 2>/dev/null) || fresh=0
+  echo "$keys" >"$STATE"
+  [[ $(config notify true) == true ]] || return 0
+  total=$(jq -r '.total // 0' "$CACHE" 2>/dev/null)
+  [[ $total =~ ^[0-9]+$ ]] || total=0
+  ((fresh > 0 && total > 0)) || return 0
+
+  head="$total update"
+  ((total > 1)) && head+="s"
+  head+=" available"
+  [[ $(jq -r '.omarchy.available' "$CACHE") == true ]] && head="Omarchy update · $head"
+  body="$(summary_line) — click to review"
+  if [[ ${OMARCHY_NO_NOTIFY:-} == 1 ]]; then
+    printf 'notification: %s | %s\n' "$head" "$body"
+    return 0
+  fi
+  omarchy-notification-send --app-name Updates -g "$(printf '\U000F06B0')" "$head" "$body" \
+    --exec omarchy-shell -q techspawn.updates open >/dev/null 2>&1 || true
+}
+
+auto() {
+  local hours at stale now
+  # One automatic check at a time, and none while an update is running.
+  exec 7>>"$AUTO_LOCK"
+  flock -n 7 || return 0
+  run_lock_free || return 0
+  hours=$(config checkHours 6)
+  [[ $hours =~ ^[0-9]+$ ]] || hours=6
+  at=$(jq -r '.at // 0' "$CACHE" 2>/dev/null)
+  [[ $at =~ ^[0-9]+$ ]] || at=0
+  stale=$(jq -r '.stale // false' "$CACHE" 2>/dev/null)
+  now=$(date +%s)
+  if [[ $stale == true ]] || ((now - at >= hours * 3600)); then
+    check >/dev/null || return 0
+    notify_new
+  fi
+}
+
+# ---------- Running updates (in a terminal, after the panel's confirmation) ----------
+
+header() { printf '\n\e[1;32m==> %s\e[0m\n' "$1"; }
+note() { printf '\e[36m%s\e[0m\n' "$1"; }
+warn() { printf '\e[33m%s\e[0m\n' "$1"; }
+fail() { printf '\e[31m%s\e[0m\n' "$1"; }
+
+# Run a command that changes something; --quiet drops its normal output. A
+# dry run prints the command instead. The run lock fd is closed so a daemon
+# started by an update can't keep it held.
+act() {
+  local quiet=0
+  if [[ $1 == --quiet ]]; then
+    quiet=1
+    shift
+  fi
+  if ((DRY_RUN)); then
+    printf '\e[2m[dry-run] %s\e[0m\n' "$(printf '%q ' "$@")"
+    return 0
+  fi
+  if ((quiet)); then
+    "$@" >/dev/null 8>&-
+  else
+    "$@" 8>&-
+  fi
+}
+
+# Yes/no in the terminal, defaulting to no. A dry run prints the question and
+# answers $2 (yes unless given) without asking.
+confirm() {
+  if ((DRY_RUN)); then
+    printf '\e[2m[dry-run] would ask: %s -> %s\e[0m\n' "$1" "${2:-yes}"
+    [[ ${2:-yes} == yes ]]
+    return
+  fi
+  gum confirm --default=false "$1"
+}
+
+PLUGINS_UPDATED=0
+SHELL_RESTARTED=0
+FAILED=()
+
+pending_ids() {
+  jq -r --arg s "$1" '.sections[] | select(.id == $s) | .items[].name' "$CACHE" 2>/dev/null
+}
+
+pending_count() {
+  jq -r --arg s "$1" '[.sections[] | select(.id == $s) | .items[]] | length' "$CACHE" 2>/dev/null || echo 0
+}
+
+# Move a plugin from $head to the reviewed $target, keeping the user's
+# uncommitted changes when they re-apply, and undoing everything if a step fails.
+apply_plugin_update() {
+  local dir=$1 head=$2 target=$3 fate=$4 label=$5 id=${1##*/} patch="" stashed=0
+  if [[ -n $fate ]]; then
+    patch="$PATCH_DIR/$id-$(date +%Y%m%d-%H%M%S).patch"
+    if ((DRY_RUN)); then
+      printf '\e[2m[dry-run] git -C %q diff --binary HEAD > %q\e[0m\n' "$dir" "$patch"
+    else
+      mkdir -p "$PATCH_DIR"
+      git -C "$dir" diff --binary HEAD >"$patch"
+    fi
+    if ! act git -C "$dir" stash push --quiet -m "techspawn.updates: local changes before ${target:0:7}"; then
+      fail "Could not set your local changes aside, so nothing was updated."
+      return 1
+    fi
+    stashed=1
+  fi
+
+  if ! act git -C "$dir" merge --ff-only --quiet "$target"; then
+    ((stashed)) && act git -C "$dir" stash pop --quiet
+    fail "Could not update $label (see git's message above). Nothing changed."
+    return 1
+  fi
+  if ! act --quiet omarchy-plugin-validate "$dir"; then
+    act git -C "$dir" reset --keep --quiet "$head"
+    ((stashed)) && act git -C "$dir" stash pop --quiet
+    fail "The new version failed Omarchy's plugin validation, so it was rolled back."
+    return 1
+  fi
+  PLUGINS_UPDATED=1
+
+  case $fate in
+  "")
+    printf '\e[32mUpdated %s to %s.\e[0m\n' "$label" "${target:0:7}"
+    ;;
+  kept | upstream)
+    if act git -C "$dir" stash pop --quiet; then
+      printf '\e[32mUpdated %s to %s.\e[0m\n' "$label" "${target:0:7}"
+      if [[ $fate == kept ]]; then
+        note "Your local changes are still in place. A copy is in $patch"
+      else
+        note "Your local changes were already part of the new version. A copy is in $patch"
+      fi
+    else
+      # Should not happen after the check above; put everything back.
+      act git -C "$dir" reset --hard --quiet "$head" && act git -C "$dir" stash pop --quiet
+      fail "Your local changes did not re-apply, so the update was undone. Nothing changed."
+      return 1
+    fi
+    ;;
+  *)
+    printf '\e[32mUpdated %s to %s.\e[0m\n' "$label" "${target:0:7}"
+    warn "Your local changes were set aside, not applied. They are the newest entry in"
+    warn "  git -C $dir stash list"
+    warn "and saved as $patch. Re-apply what you still need by hand."
+    ;;
+  esac
+}
+
+# Review and update one plugin. Not `omarchy plugin update`: quitting its diff
+# pager early kills git diff with SIGPIPE, and its `set -e` then exits before
+# the question, so nothing updates. The review happens here instead, and the
+# plugin moves to exactly the commit that was reviewed.
+update_plugin() {
+  local id=$1 dir="$PLUGINS_DIR/$1" name label src remote ref out head target count fate="" question
+  local -a info=() files=()
+  if ! valid_id "$id" || [[ -L $dir || ! -d $dir/.git ]]; then
+    fail "Not a git-managed plugin: $id"
+    return 1
+  fi
+  name=$(jq -r '.name // empty' "$dir/manifest.json" 2>/dev/null)
+  label=${name:-$id}
+  header "$label ($id)"
+
+  src=$(plugin_source "$dir")
+  if [[ -z $src ]]; then
+    echo "This plugin has no git remote to update from. Skipped."
+    return 0
+  fi
+  read -r remote ref <<<"$src"
+  if ! out=$(timeout 60 git -C "$dir" fetch --quiet --no-tags "$remote" "$ref" 2>&1); then
+    fail "Could not reach the plugin's git remote${out:+: $out}"
+    return 1
+  fi
+  head=$(git -C "$dir" rev-parse HEAD)
+  target=$(git -C "$dir" rev-parse 'FETCH_HEAD^{commit}')
+  if [[ $head == "$target" ]] || git -C "$dir" merge-base --is-ancestor "$target" "$head"; then
+    echo "Already up to date."
+    return 0
+  fi
+  if ! git -C "$dir" merge-base --is-ancestor "$head" "$target"; then
+    fail "This checkout has commits that are not upstream (your own, or upstream rewrote its"
+    fail "history), so it can't simply move forward. Update it by hand in $dir"
+    return 1
+  fi
+
+  count=$(git -C "$dir" rev-list --count "$head..$target")
+  echo "$count new commit(s):"
+  git -C "$dir" --no-pager log --format='  %h  %s  (%an)' "$head..$target"
+  echo
+  git -C "$dir" --no-pager diff --stat=100 "$head" "$target" | tail -12
+  echo
+
+  question="Update $label to ${target:0:7}?"
+  if [[ -n $(git -C "$dir" status --porcelain --untracked-files=no 2>/dev/null) ]]; then
+    mapfile -t info < <(local_changes_fate "$dir" "$head" "$target")
+    fate=${info[0]:-unknown}
+    case $fate in
+    kept)
+      mapfile -t files < <(dirty_files "$dir")
+      note "You changed ${files[*]} here. Those changes don't clash with the update and will be kept."
+      ;;
+    upstream)
+      mapfile -t files < <(dirty_files "$dir")
+      note "You changed ${files[*]} here. The new version already contains those changes."
+      ;;
+    clash)
+      files=("${info[@]:1}")
+      warn "Your local changes clash with this update in: ${files[*]}"
+      warn "Updating sets them aside: they're saved to a patch file and git stash, not applied."
+      question="Update $label to ${target:0:7} and set your local changes aside?"
+      ;;
+    *)
+      fate=unknown
+      warn "Could not tell whether your local changes clash with this update."
+      warn "Updating sets them aside: they're saved to a patch file and git stash, not applied."
+      question="Update $label to ${target:0:7} and set your local changes aside?"
+      ;;
+    esac
+    echo
+  fi
+
+  if confirm "Read the full diff first?" no; then
+    git -C "$dir" diff "$head" "$target" || true
+  fi
+  if ! confirm "$question"; then
+    echo "Skipped $label."
+    return 0
+  fi
+  apply_plugin_update "$dir" "$head" "$target" "$fate" "$label"
+}
+
+run_plugins() {
+  local -a ids=()
+  local id
+  mapfile -t ids < <(pending_ids plugins)
+  if ((${#ids[@]} == 0)); then
+    header "Shell plugins"
+    echo "No plugin updates waiting."
+    return 0
+  fi
+  for id in "${ids[@]}"; do
+    update_plugin "$id" || FAILED+=("plugin $id")
+  done
+}
+
+run_themes() {
+  local -a themes=()
+  local theme
+  header "Themes"
+  mapfile -t themes < <(omarchy-theme-extras 2>/dev/null)
+  if ((${#themes[@]} == 0)); then
+    echo "No git themes installed."
+    return 0
+  fi
+  for theme in "${themes[@]}"; do
+    echo "Updating ${theme##*/}"
+    # Fast-forward only: never a surprise merge commit in a theme.
+    act git -C "$theme" pull --ff-only --quiet || FAILED+=("theme ${theme##*/}")
+  done
+}
+
+run_system() {
+  local rc
+  header "Omarchy, system packages, apps and dev tools"
+  act omarchy-update
+  rc=$?
+  if ((rc == 0)); then
+    # omarchy-update restarts the shell at the end, which reloads plugins too.
+    SHELL_RESTARTED=1
+  else
+    FAILED+=("Omarchy update (exit $rc)")
+  fi
+}
+
+# Everything that is waiting: plugins first, so Omarchy's shell restart at the
+# end picks them up, then themes, then Omarchy's full update, but only when
+# packages, apps or dev tools are actually waiting.
+run_all() {
+  local system=1
+  if jq -e . "$CACHE" >/dev/null 2>&1; then
+    system=$(jq -r '
+      [.omarchy.available == true,
+       (.sections[] | select(.id == "system" or .id == "aur" or .id == "mise")
+         | (.items | length) > 0 or (.error // "") != "")]
+      | if any then 1 else 0 end' "$CACHE")
+  fi
+  (($(pending_count plugins) > 0)) && run_plugins
+  (($(pending_count themes) > 0)) && run_themes
+  if ((system)); then
+    run_system
+  else
+    header "Omarchy, system packages, apps and dev tools"
+    echo "Nothing waiting here, so Omarchy's full update is skipped."
+  fi
+}
+
+run_aborted() {
+  # Interrupted before the final check: the cache is already marked stale,
+  # so the next automatic check runs right away.
+  cache_update '.running = false'
+}
+
+run() {
+  local what left
+  if [[ ${1:-} == --dry-run ]]; then
+    DRY_RUN=1
+    shift
+  fi
+  (($# > 0)) || set -- all
+  ((DRY_RUN)) && warn "Dry run: showing what would run. Nothing changes."
+
+  exec 8>>"$RUN_LOCK"
+  if ! flock -n 8; then
+    fail "Another update from the Updates panel is still running in a terminal."
+    return 1
+  fi
+  if ((!DRY_RUN)); then
+    # Whatever happens next, the list is out of date until checked again,
+    # even if the update ends in a reboot.
+    cache_update --argjson now "$(date +%s)" '.running = true | .runningSince = $now | .stale = true'
+    trap run_aborted EXIT
+  fi
+
+  # Diffs go through git's pager (less): short ones skip it, long ones say
+  # how to get out.
+  export LESS='-R -F -X -Ps[ space = next page    q = done reading, then answer yes or no ]'
+
+  for what in "$@"; do
+    case $what in
+    all) run_all ;;
+    system) run_system ;;
+    aur)
+      header "Apps (AUR)"
+      act omarchy-update-aur-pkgs || FAILED+=("AUR apps")
+      ;;
+    mise)
+      header "Dev tools (mise)"
+      (cd "$HOME" && act omarchy-update-mise) || FAILED+=("dev tools")
+      ;;
+    plugins) run_plugins ;;
+    plugin:*) update_plugin "${what#plugin:}" || FAILED+=("plugin ${what#plugin:}") ;;
+    themes) run_themes ;;
+    *)
+      fail "Unknown update: $what"
+      FAILED+=("$what")
+      ;;
+    esac
+  done
+
+  # The shell reloads a plugin when its files change; a rescan also picks up
+  # new or removed panels. Not needed after Omarchy's update restarted it.
+  if ((PLUGINS_UPDATED && !SHELL_RESTARTED)); then
+    act --quiet omarchy-shell -q shell rescanPlugins
+  fi
+
+  header "Checking again"
+  flock -u 8
+  exec 8>&-
+  if ((DRY_RUN)); then
+    printf '\e[2m[dry-run] %q check\e[0m\n' "$SELF"
+  else
+    # Survives the terminal being closed, so the panel never keeps a stale list.
+    nohup "$SELF" check </dev/null >/dev/null 2>&1 &
+    wait $!
+    trap - EXIT
+    left=$(jq -r '.total // 0' "$CACHE" 2>/dev/null)
+    echo "${left:-0} update(s) left."
+    remember_seen
+  fi
+
+  if ((${#FAILED[@]})); then
+    echo
+    fail "Not updated: $(printf '%s, ' "${FAILED[@]}" | sed 's/, $//')"
+    return 1
+  fi
+  return 0
+}
+
+usage() {
+  awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$SELF"
+}
+
+main() {
+  case "${1:-}" in
+  check) check ;;
+  auto) auto ;;
+  run)
+    shift
+    run "$@"
+    ;;
+  *)
+    usage
+    return 1
+    ;;
+  esac
+}
+
+# Everything above is definitions, so updating this plugin while it runs
+# can't change the code that is already executing. Sourcing (for tests) only
+# loads the functions.
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+  main "$@"
+  exit $?
+fi

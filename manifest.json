@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "techspawn.updates",
+  "name": "Updates",
+  "version": "1.1.0",
+  "author": "Raj Shimpi",
+  "license": "MIT",
+  "description": "One place for every update: Omarchy, system packages (pacman), AUR apps, mise dev tools, git-managed shell plugins and git themes. Checks every few hours, notifies once when something new arrives, and updates only after you confirm, in a terminal you can watch. Plugin updates show their changes first and keep your own local edits.",
+  "repository": "https://github.com/RajShimpi/omarchy-updates",
+  "kinds": ["bar-widget", "service"],
+  "entryPoints": { "barWidget": "Panel.qml", "service": "Service.qml" },
+  "barWidget": {
+    "displayName": "Updates",
+    "description": "Pending OS, app, dev tool, plugin and theme updates, with confirm-before-update",
+    "category": "System",
+    "aliases": ["updates", "upgrade", "pacman", "aur", "mise", "plugins"],
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
