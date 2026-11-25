@@ -348,7 +348,9 @@ check() {
     fi
   fi
 
-  mise=$(jq -c '[to_entries[] | {name: .key, from: (.value.current // ""), to: (.value.latest // "")} | select(.from != .to and .to != "")]' "$tmp/mise" 2>/dev/null) || mise="[]"
+  # current is null for a tool that is configured but not installed (lazy tools):
+  # "mise up" leaves those alone, so they are not pending updates.
+  mise=$(jq -c '[to_entries[] | select(.value.current != null) | {name: .key, from: (.value.current // ""), to: (.value.latest // "")} | select(.from != .to and .to != "")]' "$tmp/mise" 2>/dev/null) || mise="[]"
   [[ -n $mise ]] || mise="[]"
   rc=$(cat "$tmp/mise.rc" 2>/dev/null)
   if [[ $rc == 124 ]]; then
