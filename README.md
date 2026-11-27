@@ -56,10 +56,12 @@ When the panel is open:
 ## Install
 
 ```bash
-omarchy plugin add https://github.com/RajShimpi/omarchy-updates
-omarchy plugin enable techspawn.updates
-omarchy bar put techspawn.updates
+omarchy plugin add https://github.com/RajShimpi/omarchy-updates --enable
 ```
+
+That one command is the whole install: enabling puts the widget on the right of
+the bar (its default section) and starts the background check. No extra setup
+is needed. To move it later: `omarchy bar move techspawn.updates --section <section>`.
 
 You can also use **Install plugin** in the Omarchy menu with the repository URL.
 
